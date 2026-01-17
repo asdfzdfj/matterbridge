@@ -15,6 +15,7 @@ import (
 	"github.com/matterbridge-org/matterbridge/matterhook"
 	"github.com/rs/xid"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/socketmode"
 )
 
 type Bslack struct {
@@ -23,8 +24,14 @@ type Bslack struct {
 
 	mh  *matterhook.Client
 	sc  *slack.Client
+
+	// legacy RTM connection
 	rtm *slack.RTM
 	si  *slack.Info
+
+	// new socket based Events API connection
+	smc *socketmode.Client
+	smi *socketmode.ConnectionInfo
 
 	cache        *lru.Cache
 	uuid         string
@@ -57,6 +64,7 @@ const (
 	cfileDownloadChannel = "file_download_channel"
 
 	tokenConfig           = "Token"
+	appTokenConfig = "AppToken"
 	incomingWebhookConfig = "WebhookBindAddress"
 	outgoingWebhookConfig = "WebhookURL"
 	skipTLSConfig         = "SkipTLSVerify"
@@ -76,6 +84,10 @@ func New(cfg *bridge.Config) bridge.Bridger {
 		cfg.Log.Warn("Legacy tokens may be deprecated by Slack at short notice. See the Matterbridge GitHub wiki for a migration guide.")
 		cfg.Log.Warn("See https://github.com/42wim/matterbridge/wiki/Slack-bot-setup")
 		return NewLegacy(cfg)
+	}
+	appToken := cfg.GetString(appTokenConfig)
+	if appToken != "" && !strings.HasPrefix(appToken, "xapp-") {
+		cfg.Log.Error("App token missing `xapp-` prefix")
 	}
 	return newBridge(cfg)
 }
@@ -105,9 +117,28 @@ func (b *Bslack) Connect() error {
 		return errors.New("no connection method found: WebhookBindAddress, WebhookURL or Token need to be configured")
 	}
 
+	//appToken := b.GetString(appTokenConfig)
+	token := b.GetString(tokenConfig)
+
+	// if both app token and bot token is set then prefer socketmode events api (replaces RTM)
+	//if appToken != "" && token != "" {
+	//	b.Log.Info("Connecting socketmode events using tokens")
+
+	//	b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
+
+	//	b.channels = newChannelManager(b.Log, b.sc)
+	//	b.users = newUserManager(b.Log, b.sc)
+
+	//	// TODO: make replacements of these rtm transport using socketmode events
+	//	b.rtm = b.sc.NewRTM()
+	//	go b.rtm.ManageConnection()
+	//	go b.handleSlack()
+	//	return nil
+	//}
+
 	// If we have a token we use the Slack websocket-based RTM for both sending and receiving.
-	if token := b.GetString(tokenConfig); token != "" {
-		b.Log.Info("Connecting using token")
+	if token != "" {
+		b.Log.Info("Connecting RTM using token")
 
 		b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
 

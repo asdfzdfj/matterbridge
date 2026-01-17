@@ -19,9 +19,12 @@ func (b *Bslack) handleSlack() {
 	if b.GetString(incomingWebhookConfig) != "" && b.GetString(tokenConfig) == "" {
 		b.Log.Debugf("Choosing webhooks based receiving")
 		go b.handleMatterHook(messages)
+	//} else if b.GetString(appTokenConfig) != "" && b.GetString(tokenConfig) != "" {
+	//	b.Log.Debugf("Choosing Socekt mode Events API receiving")
+	//	go b.handleSlackClientEvents(messages)
 	} else {
-		b.Log.Debugf("Choosing token based receiving")
-		go b.handleSlackClient(messages)
+		b.Log.Debugf("Choosing token based RTM receiving")
+		go b.handleSlackClientRTM(messages)
 	}
 	time.Sleep(time.Second)
 	b.Log.Debug("Start listening for Slack messages")
@@ -47,7 +50,10 @@ func (b *Bslack) handleSlack() {
 	}
 }
 
-func (b *Bslack) handleSlackClient(messages chan *config.Message) {
+func (b *Bslack) handleSlackClientEvents(messages chan *config.Message) {
+}
+
+func (b *Bslack) handleSlackClientRTM(messages chan *config.Message) {
 	for msg := range b.rtm.IncomingEvents {
 		if msg.Type != sUserTyping && msg.Type != sHello && msg.Type != sLatencyReport {
 			b.Log.Debugf("== Receiving event %#v", msg.Data)
