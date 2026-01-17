@@ -2,6 +2,7 @@ package bslack
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -22,16 +23,18 @@ type Bslack struct {
 	sync.RWMutex
 	*bridge.Config
 
-	mh  *matterhook.Client
-	sc  *slack.Client
+	mh *matterhook.Client
+	sc *slack.Client
 
 	// legacy RTM connection
 	rtm *slack.RTM
-	si  *slack.Info
 
 	// new socket based Events API connection
-	smc *socketmode.Client
-	smi *socketmode.ConnectionInfo
+	smc     *socketmode.Client
+	smcStop context.CancelFunc
+
+	actingUserID   string
+	actingUserName string
 
 	cache        *lru.Cache
 	uuid         string
@@ -64,7 +67,7 @@ const (
 	cfileDownloadChannel = "file_download_channel"
 
 	tokenConfig           = "Token"
-	appTokenConfig = "AppToken"
+	appTokenConfig        = "AppToken"
 	incomingWebhookConfig = "WebhookBindAddress"
 	outgoingWebhookConfig = "WebhookURL"
 	skipTLSConfig         = "SkipTLSVerify"
@@ -117,37 +120,31 @@ func (b *Bslack) Connect() error {
 		return errors.New("no connection method found: WebhookBindAddress, WebhookURL or Token need to be configured")
 	}
 
-	//appToken := b.GetString(appTokenConfig)
+	appToken := b.GetString(appTokenConfig)
 	token := b.GetString(tokenConfig)
+	debug := b.GetBool("Debug")
 
-	// if both app token and bot token is set then prefer socketmode events api (replaces RTM)
-	//if appToken != "" && token != "" {
-	//	b.Log.Info("Connecting socketmode events using tokens")
-
-	//	b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
-
-	//	b.channels = newChannelManager(b.Log, b.sc)
-	//	b.users = newUserManager(b.Log, b.sc)
-
-	//	// TODO: make replacements of these rtm transport using socketmode events
-	//	b.rtm = b.sc.NewRTM()
-	//	go b.rtm.ManageConnection()
-	//	go b.handleSlack()
-	//	return nil
-	//}
-
-	// If we have a token we use the Slack websocket-based RTM for both sending and receiving.
+	// If we have a token we use the Slack websocket-based RTM or Events API for both sending and receiving.
 	if token != "" {
-		b.Log.Info("Connecting RTM using token")
+		b.Log.Info("Connecting using token")
 
-		b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
+		b.sc = slack.New(token, slack.OptionDebug(debug), slack.OptionAppLevelToken(appToken))
 
 		b.channels = newChannelManager(b.Log, b.sc)
 		b.users = newUserManager(b.Log, b.sc)
 
-		b.rtm = b.sc.NewRTM()
-		go b.rtm.ManageConnection()
+		// if app token is set then prefer using socketmode events rather than legacy RTM
+		if appToken != "" {
+			ctx, stop := context.WithCancel(context.Background())
+			b.smc = socketmode.New(b.sc, socketmode.OptionDebug(debug), socketmode.OptionLog(&smlog{b.Log}))
+			b.smcStop = stop
+			go b.smc.RunContext(ctx)
+		} else {
+			b.rtm = b.sc.NewRTM()
+			go b.rtm.ManageConnection()
+		}
 		go b.handleSlack()
+
 		return nil
 	}
 
@@ -173,7 +170,14 @@ func (b *Bslack) Connect() error {
 }
 
 func (b *Bslack) Disconnect() error {
-	return b.rtm.Disconnect()
+	if b.smc != nil {
+		b.smcStop()
+		return nil
+	}
+	if b.rtm != nil {
+		return b.rtm.Disconnect()
+	}
+	return nil
 }
 
 // JoinChannel only acts as a verification method that checks whether Matterbridge's
@@ -239,7 +243,10 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 	if b.GetString(outgoingWebhookConfig) != "" && b.GetString(tokenConfig) == "" {
 		return "", b.sendWebhook(msg)
 	}
-	return b.sendRTM(msg)
+	if b.rtm != nil {
+		return b.sendRTM(msg)
+	}
+	return b.sendAPI(msg)
 }
 
 // sendWebhook uses the configured WebhookURL to send the message
@@ -371,6 +378,68 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	return b.postMessage(&msg, channelInfo)
 }
 
+func (b *Bslack) sendAPI(msg config.Message) (string, error) {
+	// Handle channelmember messages.
+	if handled := b.handleGetChannelMembers(&msg); handled {
+		return "", nil
+	}
+
+	channelInfo, err := b.channels.getChannel(msg.Channel)
+	if err != nil {
+		return "", fmt.Errorf("could not send message: %v", err)
+	}
+	// no user typing in events api
+	if msg.Event == config.EventUserTyping {
+		return "", nil
+	}
+
+	var handled bool
+
+	// Handle topic/purpose updates.
+	if handled, err = b.handleTopicOrPurpose(&msg, channelInfo); handled {
+		return "", err
+	}
+
+	// Handle prefix hint for unthreaded messages.
+	if msg.ParentNotFound() {
+		msg.ParentID = ""
+		msg.Text = fmt.Sprintf("[thread]: %s", msg.Text)
+	}
+
+	// Handle message deletions.
+	if handled, err = b.deleteMessageAPI(&msg, channelInfo); handled {
+		return msg.ID, err
+	}
+
+	// Prepend nickname if configured.
+	if b.GetBool(useNickPrefixConfig) {
+		msg.Text = msg.Username + msg.Text
+	}
+
+	// Handle message edits.
+	if handled, err = b.editMessageAPI(&msg, channelInfo); handled {
+		return msg.ID, err
+	}
+
+	// Upload a file if it exists.
+	if len(msg.Extra) > 0 {
+		extraMsgs := helper.HandleExtra(&msg, b.General)
+		for i := range extraMsgs {
+			rmsg := &extraMsgs[i]
+			rmsg.Text = rmsg.Username + rmsg.Text
+			_, err = b.postMessage(rmsg, channelInfo)
+			if err != nil {
+				b.Log.Error(err)
+			}
+		}
+		// Upload files if necessary (from Slack, Telegram or Mattermost).
+		return b.uploadFile(&msg, channelInfo.ID)
+	}
+
+	// Post message.
+	return b.postMessageEAPI(&msg, channelInfo)
+}
+
 func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) error {
 	var updateFunc func(channelID string, value string) (*slack.Channel, error)
 
@@ -437,6 +506,29 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 }
 
+func (b *Bslack) deleteMessageAPI(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
+	if msg.Event != config.EventMsgDelete {
+		return false, nil
+	}
+
+	// Some protocols echo deletes, but with an empty ID.
+	if msg.ID == "" {
+		return true, nil
+	}
+
+	for {
+		_, _, err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
+		if err == nil {
+			return true, nil
+		}
+
+		if err = handleRateLimit(b.Log, err); err != nil {
+			b.Log.Errorf("Failed to delete user message from Slack: %#v", err)
+			return true, err
+		}
+	}
+}
+
 func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
 	if msg.ID == "" {
 		return false, nil
@@ -455,7 +547,44 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 }
 
+func (b *Bslack) editMessageAPI(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
+	if msg.ID == "" {
+		return false, nil
+	}
+	messageOptions := b.prepareMessageOptions(msg)
+	for {
+		_, _, _, err := b.sc.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
+		if err == nil {
+			return true, nil
+		}
+
+		if err = handleRateLimit(b.Log, err); err != nil {
+			b.Log.Errorf("Failed to edit user message on Slack: %#v", err)
+			return true, err
+		}
+	}
+}
+
 func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
+	// don't post empty messages
+	if msg.Text == "" {
+		return "", nil
+	}
+	messageOptions := b.prepareMessageOptions(msg)
+	for {
+		_, id, err := b.sc.PostMessage(channelInfo.ID, messageOptions...)
+		if err == nil {
+			return id, nil
+		}
+
+		if err = handleRateLimit(b.Log, err); err != nil {
+			b.Log.Errorf("Failed to sent user message to Slack: %#v", err)
+			return "", err
+		}
+	}
+}
+
+func (b *Bslack) postMessageEAPI(msg *config.Message, channelInfo *slack.Channel) (string, error) {
 	// don't post empty messages
 	if msg.Text == "" {
 		return "", nil
@@ -572,10 +701,10 @@ func (b *Bslack) prepareMessageOptions(msg *config.Message) []slack.MsgOption {
 	return opts
 }
 
-func (b *Bslack) createAttach(extra map[string][]interface{}) []slack.Attachment {
+func (b *Bslack) createAttach(extra map[string][]any) []slack.Attachment {
 	var attachements []slack.Attachment
 	for _, v := range extra["attachments"] {
-		entry := v.(map[string]interface{})
+		entry := v.(map[string]any)
 		s := slack.Attachment{
 			Fallback:   extractStringField(entry, "fallback"),
 			Color:      extractStringField(entry, "color"),
@@ -596,7 +725,7 @@ func (b *Bslack) createAttach(extra map[string][]interface{}) []slack.Attachment
 	return attachements
 }
 
-func extractStringField(data map[string]interface{}, field string) string {
+func extractStringField(data map[string]any, field string) string {
 	if rawValue, found := data[field]; found {
 		if value, ok := rawValue.(string); ok {
 			return value
