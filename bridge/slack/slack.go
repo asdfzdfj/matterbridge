@@ -287,6 +287,7 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	}
 	if msg.Event == config.EventUserTyping {
 		if b.GetBool("ShowUserTyping") {
+			// this one is RTM specific
 			b.rtm.SendMessage(b.rtm.NewTypingMessage(channelInfo.ID))
 		}
 		return "", nil
@@ -345,9 +346,9 @@ func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Ch
 	incomingChangeType, text := b.extractTopicOrPurpose(msg.Text)
 	switch incomingChangeType {
 	case "topic":
-		updateFunc = b.rtm.SetTopicOfConversation
+		updateFunc = b.sc.SetTopicOfConversation
 	case "purpose":
-		updateFunc = b.rtm.SetPurposeOfConversation
+		updateFunc = b.sc.SetPurposeOfConversation
 	default:
 		b.Log.Errorf("Unhandled type received from extractTopicOrPurpose: %s", incomingChangeType)
 		return nil
@@ -393,7 +394,7 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 
 	for {
-		_, _, err := b.rtm.DeleteMessage(channelInfo.ID, msg.ID)
+		_, _, err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
 		if err == nil {
 			return true, nil
 		}
@@ -411,7 +412,7 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, _, _, err := b.rtm.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
+		_, _, _, err := b.sc.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
 		if err == nil {
 			return true, nil
 		}
@@ -430,7 +431,7 @@ func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (s
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, id, err := b.rtm.PostMessage(channelInfo.ID, messageOptions...)
+		_, id, err := b.sc.PostMessage(channelInfo.ID, messageOptions...)
 		if err == nil {
 			return id, nil
 		}
