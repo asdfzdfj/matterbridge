@@ -243,9 +243,6 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 	if b.GetString(outgoingWebhookConfig) != "" && b.GetString(tokenConfig) == "" {
 		return "", b.sendWebhook(msg)
 	}
-	if b.rtm != nil {
-		return b.sendRTM(msg)
-	}
 	return b.sendAPI(msg)
 }
 
@@ -263,7 +260,6 @@ func (b *Bslack) sendWebhook(msg config.Message) error {
 	if msg.Extra != nil {
 		// This sends a message only if we received a config.EVENT_FILE_FAILURE_SIZE.
 		for _, rmsg := range helper.HandleExtra(&msg, b.General) {
-			rmsg := rmsg // scopelint
 			iconURL := config.GetIconURL(&rmsg, b.GetString(iconURLConfig))
 			matterMessage := matterhook.OMessage{
 				IconURL:  iconURL,
@@ -313,7 +309,7 @@ func (b *Bslack) sendWebhook(msg config.Message) error {
 	return nil
 }
 
-func (b *Bslack) sendRTM(msg config.Message) (string, error) {
+func (b *Bslack) sendAPI(msg config.Message) (string, error) {
 	// Handle channelmember messages.
 	if handled := b.handleGetChannelMembers(&msg); handled {
 		return "", nil
@@ -323,9 +319,10 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not send message: %v", err)
 	}
+
+	// this one is RTM specific
 	if msg.Event == config.EventUserTyping {
-		if b.GetBool("ShowUserTyping") {
-			// this one is RTM specific
+		if b.GetBool("ShowUserTyping") && b.rtm != nil {
 			b.rtm.SendMessage(b.rtm.NewTypingMessage(channelInfo.ID))
 		}
 		return "", nil
@@ -376,68 +373,6 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 
 	// Post message.
 	return b.postMessage(&msg, channelInfo)
-}
-
-func (b *Bslack) sendAPI(msg config.Message) (string, error) {
-	// Handle channelmember messages.
-	if handled := b.handleGetChannelMembers(&msg); handled {
-		return "", nil
-	}
-
-	channelInfo, err := b.channels.getChannel(msg.Channel)
-	if err != nil {
-		return "", fmt.Errorf("could not send message: %v", err)
-	}
-	// no user typing in events api
-	if msg.Event == config.EventUserTyping {
-		return "", nil
-	}
-
-	var handled bool
-
-	// Handle topic/purpose updates.
-	if handled, err = b.handleTopicOrPurpose(&msg, channelInfo); handled {
-		return "", err
-	}
-
-	// Handle prefix hint for unthreaded messages.
-	if msg.ParentNotFound() {
-		msg.ParentID = ""
-		msg.Text = fmt.Sprintf("[thread]: %s", msg.Text)
-	}
-
-	// Handle message deletions.
-	if handled, err = b.deleteMessageAPI(&msg, channelInfo); handled {
-		return msg.ID, err
-	}
-
-	// Prepend nickname if configured.
-	if b.GetBool(useNickPrefixConfig) {
-		msg.Text = msg.Username + msg.Text
-	}
-
-	// Handle message edits.
-	if handled, err = b.editMessageAPI(&msg, channelInfo); handled {
-		return msg.ID, err
-	}
-
-	// Upload a file if it exists.
-	if len(msg.Extra) > 0 {
-		extraMsgs := helper.HandleExtra(&msg, b.General)
-		for i := range extraMsgs {
-			rmsg := &extraMsgs[i]
-			rmsg.Text = rmsg.Username + rmsg.Text
-			_, err = b.postMessage(rmsg, channelInfo)
-			if err != nil {
-				b.Log.Error(err)
-			}
-		}
-		// Upload files if necessary (from Slack, Telegram or Mattermost).
-		return b.uploadFile(&msg, channelInfo.ID)
-	}
-
-	// Post message.
-	return b.postMessageEAPI(&msg, channelInfo)
 }
 
 func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) error {
@@ -506,29 +441,6 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 }
 
-func (b *Bslack) deleteMessageAPI(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
-	if msg.Event != config.EventMsgDelete {
-		return false, nil
-	}
-
-	// Some protocols echo deletes, but with an empty ID.
-	if msg.ID == "" {
-		return true, nil
-	}
-
-	for {
-		_, _, err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
-		if err == nil {
-			return true, nil
-		}
-
-		if err = handleRateLimit(b.Log, err); err != nil {
-			b.Log.Errorf("Failed to delete user message from Slack: %#v", err)
-			return true, err
-		}
-	}
-}
-
 func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
 	if msg.ID == "" {
 		return false, nil
@@ -547,44 +459,7 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 }
 
-func (b *Bslack) editMessageAPI(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
-	if msg.ID == "" {
-		return false, nil
-	}
-	messageOptions := b.prepareMessageOptions(msg)
-	for {
-		_, _, _, err := b.sc.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
-		if err == nil {
-			return true, nil
-		}
-
-		if err = handleRateLimit(b.Log, err); err != nil {
-			b.Log.Errorf("Failed to edit user message on Slack: %#v", err)
-			return true, err
-		}
-	}
-}
-
 func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
-	// don't post empty messages
-	if msg.Text == "" {
-		return "", nil
-	}
-	messageOptions := b.prepareMessageOptions(msg)
-	for {
-		_, id, err := b.sc.PostMessage(channelInfo.ID, messageOptions...)
-		if err == nil {
-			return id, nil
-		}
-
-		if err = handleRateLimit(b.Log, err); err != nil {
-			b.Log.Errorf("Failed to sent user message to Slack: %#v", err)
-			return "", err
-		}
-	}
-}
-
-func (b *Bslack) postMessageEAPI(msg *config.Message, channelInfo *slack.Channel) (string, error) {
 	// don't post empty messages
 	if msg.Text == "" {
 		return "", nil

@@ -9,122 +9,75 @@ import (
 	"github.com/matterbridge-org/matterbridge/bridge/config"
 	"github.com/sirupsen/logrus"
 	"github.com/slack-go/slack"
-	"github.com/slack-go/slack/slackevents"
 )
 
 // populateReceivedMessage shapes the initial Matterbridge message that we will forward to the
 // router before we apply message-dependent modifications.
-func (b *Bslack) populateReceivedMessage(ev *slack.MessageEvent) (*config.Message, error) {
+func (b *Bslack) populateReceivedMessage(msg *slack.Msg, submsg *slack.Msg, edited bool) (*config.Message, error) {
 	// Use our own func because rtm.GetChannelInfo doesn't work for private channels.
-	channel, err := b.channels.getChannelByID(ev.Channel)
+	channel, err := b.channels.getChannelByID(msg.Channel)
 	if err != nil {
 		return nil, err
 	}
 
 	rmsg := &config.Message{
-		Text:     ev.Text,
+		Text:     msg.Text,
 		Channel:  channel.Name,
 		Account:  b.Account,
-		ID:       ev.Timestamp,
-		Extra:    make(map[string][]interface{}),
-		ParentID: ev.ThreadTimestamp,
+		ID:       msg.Timestamp,
+		Extra:    make(map[string][]any),
+		ParentID: msg.ThreadTimestamp,
 		Protocol: b.Protocol,
 	}
 	if b.useChannelID {
 		rmsg.Channel = "ID:" + channel.ID
 	}
 
-	// Handle 'edit' messages.
-	if ev.SubMessage != nil && !b.GetBool(editDisableConfig) {
-		rmsg.ID = ev.SubMessage.Timestamp
-		if ev.SubMessage.ThreadTimestamp != ev.SubMessage.Timestamp {
-			b.Log.Debugf("SubMessage %#v", ev.SubMessage)
-			rmsg.Text = ev.SubMessage.Text + b.GetString(editSuffixConfig)
+	// Handle 'edit' messages
+	if edited && submsg != nil {
+		// For edits, only submessage has thread ts. (and previous message too?)
+		// Ensures edits to threaded messages maintain their prefix hint on the
+		// unthreaded end.
+		rmsg.ParentID = submsg.ThreadTimestamp
+
+		if !b.GetBool(editDisableConfig) {
+			rmsg.ID = submsg.Timestamp
+			if submsg.ThreadTimestamp != submsg.Timestamp {
+				b.Log.Debugf("SubMessage %#v", submsg)
+				rmsg.Text = submsg.Text + b.GetString(editSuffixConfig)
+			}
 		}
 	}
 
-	// For edits, only submessage has thread ts.
-	// Ensures edits to threaded messages maintain their prefix hint on the
-	// unthreaded end.
-	if ev.SubMessage != nil {
-		rmsg.ParentID = ev.SubMessage.ThreadTimestamp
-	}
-
-	if err = b.populateMessageWithUserInfo(ev, rmsg); err != nil {
+	if err = b.populateMessageWithUserInfo(msg, rmsg); err != nil {
 		return nil, err
 	}
 	return rmsg, err
 }
 
-func (b *Bslack) populateReceivedMessageEAPI(ev *slackevents.MessageEvent) (*config.Message, error) {
-	// Use our own func because rtm.GetChannelInfo doesn't work for private channels.
-	channel, err := b.channels.getChannelByID(ev.Channel)
-	if err != nil {
-		return nil, err
-	}
-
-	b.Log.Debugf("Message %#v", ev.Message)
-	rmsg := &config.Message{
-		Text:     ev.Message.Text,
-		Channel:  channel.Name,
-		Account:  b.Account,
-		ID:       ev.Message.Timestamp,
-		Extra:    make(map[string][]interface{}),
-		ParentID: ev.Message.ThreadTimestamp,
-		Protocol: b.Protocol,
-	}
-	if b.useChannelID {
-		rmsg.Channel = "ID:" + channel.ID
-	}
-
-	// Handle 'edit' messages.
-	if ev.IsEdited() && !b.GetBool(editDisableConfig) {
-		prev := ev.PreviousMessage
-		rmsg.ID = prev.Timestamp
-		if prev.ThreadTimestamp != prev.Timestamp {
-			b.Log.Debugf("PreviousMessage %#v", prev)
-			rmsg.Text = ev.Message.Text + b.GetString(editSuffixConfig)
-		}
-	}
-
-	// For edits, only submessage has thread ts.
-	// Ensures edits to threaded messages maintain their prefix hint on the
-	// unthreaded end.
-	if ev.IsEdited() {
-		rmsg.ParentID = ev.PreviousMessage.ThreadTimestamp
-	}
-
-	if err = b.populateMessageWithUserInfoEAPI(ev, rmsg); err != nil {
-		return nil, err
-	}
-	return rmsg, err
-}
-
-func (b *Bslack) populateMessageWithUserInfo(ev *slack.MessageEvent, rmsg *config.Message) error {
-	if ev.SubType == sMessageDeleted || ev.SubType == sFileComment {
+func (b *Bslack) populateMessageWithUserInfo(msg *slack.Msg, rmsg *config.Message) error {
+	if msg.SubType == sMessageDeleted || msg.SubType == sFileComment {
 		return nil
 	}
 
-	// First, deal with bot-originating messages but only do so when not using webhooks: we
-	// would not be able to distinguish which bot would be sending them.
-	if err := b.populateMessageWithBotInfo(ev, rmsg); err != nil {
+	// First, deal with bot-originating messages but only do so when not using webhooks:
+	// we would not be able to distinguish which bot would be sending them.
+	if err := b.populateMessageWithBotInfo(msg.BotID, msg.Username, rmsg); err != nil {
 		return err
 	}
 
 	// Second, deal with "real" users if we have the necessary information.
 	var userID string
 	switch {
-	case ev.User != "":
-		userID = ev.User
-	case ev.SubMessage != nil && ev.SubMessage.User != "":
-		userID = ev.SubMessage.User
+	case msg.User != "":
+		userID = msg.User
 	default:
 		return nil
 	}
 
 	user := b.users.getUser(userID)
 	if user == nil {
-		return fmt.Errorf("could not find information for user with id %s", ev.User)
+		return fmt.Errorf("could not find information for user with id %s", msg.User)
 	}
 
 	rmsg.UserID = user.ID
@@ -138,46 +91,8 @@ func (b *Bslack) populateMessageWithUserInfo(ev *slack.MessageEvent, rmsg *confi
 	return nil
 }
 
-func (b *Bslack) populateMessageWithUserInfoEAPI(ev *slackevents.MessageEvent, rmsg *config.Message) error {
-	if ev.SubType == sMessageDeleted || ev.SubType == sFileComment {
-		return nil
-	}
-
-	// First, deal with bot-originating messages but only do so when not using webhooks: we
-	// would not be able to distinguish which bot would be sending them.
-	if err := b.populateMessageWithBotInfoEAPI(ev, rmsg); err != nil {
-		return err
-	}
-
-	// Second, deal with "real" users if we have the necessary information.
-	var userID string
-	switch {
-	case ev.User != "":
-		userID = ev.User
-	case ev.PreviousMessage != nil && ev.PreviousMessage.User != "":
-		userID = ev.PreviousMessage.User
-	default:
-		return nil
-	}
-
-	user := b.users.getUser(userID)
-	if user == nil {
-		return fmt.Errorf("could not find information for user with id %s", ev.User)
-	}
-
-	rmsg.UserID = user.ID
-	rmsg.Username = user.Name
-	if user.Profile.DisplayName != "" {
-		rmsg.Username = user.Profile.DisplayName
-	}
-	if b.GetBool("UseFullName") && user.Profile.RealName != "" {
-		rmsg.Username = user.Profile.RealName
-	}
-	return nil
-}
-
-func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config.Message) error {
-	if ev.BotID == "" || b.GetString(outgoingWebhookConfig) != "" {
+func (b *Bslack) populateMessageWithBotInfo(botID string, username string, rmsg *config.Message) error {
+	if botID == "" || b.GetString(outgoingWebhookConfig) != "" {
 		return nil
 	}
 
@@ -185,7 +100,7 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 	var bot *slack.Bot
 	for {
 		bot, err = b.sc.GetBotInfo(slack.GetBotInfoParameters{
-			Bot: ev.BotID,
+			Bot: botID,
 		})
 		if err == nil {
 			break
@@ -200,40 +115,8 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 
 	if bot.Name != "" {
 		rmsg.Username = bot.Name
-		if ev.Username != "" {
-			rmsg.Username = ev.Username
-		}
-		rmsg.UserID = bot.ID
-	}
-	return nil
-}
-
-func (b *Bslack) populateMessageWithBotInfoEAPI(ev *slackevents.MessageEvent, rmsg *config.Message) error {
-	if ev.BotID == "" || b.GetString(outgoingWebhookConfig) != "" {
-		return nil
-	}
-
-	var err error
-	var bot *slack.Bot
-	for {
-		bot, err = b.sc.GetBotInfo(slack.GetBotInfoParameters{
-			Bot: ev.BotID,
-		})
-		if err == nil {
-			break
-		}
-
-		if err = handleRateLimit(b.Log, err); err != nil {
-			b.Log.Errorf("Could not retrieve bot information: %#v", err)
-			return err
-		}
-	}
-	b.Log.Debugf("Found bot %#v", bot)
-
-	if bot.Name != "" {
-		rmsg.Username = bot.Name
-		if ev.Username != "" {
-			rmsg.Username = ev.Username
+		if username != "" {
+			rmsg.Username = username
 		}
 		rmsg.UserID = bot.ID
 	}
