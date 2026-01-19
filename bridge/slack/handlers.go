@@ -104,6 +104,9 @@ func (b *Bslack) handleSlackClientEAPI(messages chan *config.Message) {
 
 			switch ev := ievt.Data.(type) {
 			case *slackevents.MessageEvent:
+				// for consideration: re-unmarshal incoming data to slack.MessageEvent
+				// then simply feed it back into the existing legacy RTM pipeline
+				// https://github.com/tippl/matterbridge/commit/42e75e2abff3627e5dd7c5de6eb42bbaa08236f8
 				if b.skipMessageEventEAPI(ev) {
 					b.Log.Debugf("Skipped message: %#v", ev)
 					continue
